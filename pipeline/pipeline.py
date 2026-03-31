@@ -1,13 +1,17 @@
 """
 RFQ Streaming Pipeline
 
-Merges three NATS streams and one synchronous HTTP lookup (Soul REST API)
-into a stateful Bytewax dataflow that drives the full RFQ lifecycle:
+Merges three NATS streams into a stateful Bytewax dataflow that drives
+the full RFQ lifecycle:
 
   RECEIVED → ENRICHED → PRICED → QUOTED
        ├─ client ACKNOWLEDGE → ACKNOWLEDGED → CONCLUDED
        ├─ client PASS        → REJECTED
        └─ TTL exceeded       → EXPIRED
+
+Instrument name resolution uses op.enrich_cached with a Soul REST source.
+The TTLCache is keyed by ISIN and re-fetches names every 24 hours — all
+other lookups are served from memory with no HTTP call.
 
 A second ISIN-keyed repricing map re-emits QUOTED rows with fresh bid/ask
 on every pricing.stream tick so live prices flow to the UI continuously.
@@ -19,21 +23,21 @@ Run with:
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
-from typing import Optional, TypedDict
+from datetime import datetime, timedelta, timezone
+from typing import Optional, TypedDict, cast
 
 import bytewax.operators as op
-import httpx
 from bytewax.dataflow import Dataflow
 
 from models import ClientResponse, EnrichedRFQ, PricedQuote, RFQ, RFQState, from_nats_bytes
 from pipeline.sources.nats_source import NatsSource
+from pipeline.sources.soul_source import soul_getter, soul_mapper
 from pipeline.sinks.websocket_sink import WebSocketSink
 
-SOUL_URL = "http://localhost:8000"
 RFQ_TTL_SECONDS = 60.0
 
-type TaggedEvent = tuple[str, RFQ | PricedQuote | ClientResponse | None]
+# (tag, payload) — RFQ tag carries (RFQ, instrument_name) pair after enrichment
+type TaggedEvent = tuple[str, tuple[RFQ, str] | PricedQuote | ClientResponse | None]
 type RepricingEvent = tuple[str, PricedQuote | EnrichedRFQ]
 
 # ---------------------------------------------------------------------------
@@ -42,47 +46,26 @@ type RepricingEvent = tuple[str, PricedQuote | EnrichedRFQ]
 
 _price_cache: dict[str, PricedQuote] = {}
 
-# ---------------------------------------------------------------------------
-# Soul REST lookup — synchronous, cached per ISIN
-# ---------------------------------------------------------------------------
-
-_soul_cache: dict[str, str] = {}
-_soul_client = httpx.Client(base_url=SOUL_URL, timeout=2.0)
-
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def soul_lookup(isin: str) -> str:
-    """Return instrument name for ISIN, cached after first call."""
-    if isin in _soul_cache:
-        return _soul_cache[isin]
-    try:
-        resp = _soul_client.get(
-            "/api/tables/instruments/rows",
-            params={"_filters": f"isin:{isin}", "_limit": "1"},
-        )
-        resp.raise_for_status()
-        data: list[dict[str, str]] = resp.json().get("data", [])
-        name = data[0]["name"] if data else f"Unknown ({isin})"
-    except Exception as e:
-        print(f"[soul_lookup] Failed for {isin}: {e}")
-        name = f"Unknown ({isin})"
-    _soul_cache[isin] = name
-    return name
 
 
 # ---------------------------------------------------------------------------
 # Stream tagging and keying
 # ---------------------------------------------------------------------------
 
-def _tag_rfq(raw: bytes) -> TaggedEvent:
+def _parse_rfq(raw: bytes) -> Optional[RFQ]:
+    """Parse raw bytes → RFQ. Returns None on error (filtered downstream)."""
     try:
-        return ("rfq", from_nats_bytes(raw, RFQ))
-    except Exception as e:
+        return from_nats_bytes(raw, RFQ)
+    except (ValueError, KeyError) as e:
         print(f"[pipeline] Failed to parse RFQ: {e}")
-        return ("error", None)
+        return None
+
+
+def _tag_enriched_rfq(pair: tuple[RFQ, str]) -> TaggedEvent:
+    return ("rfq", pair)
 
 
 def _tag_price(raw: bytes) -> TaggedEvent:
@@ -90,7 +73,7 @@ def _tag_price(raw: bytes) -> TaggedEvent:
         quote = PricedQuote.from_bytes(raw)
         _price_cache[quote.isin] = quote
         return ("price", quote)
-    except Exception as e:
+    except (ValueError, KeyError) as e:
         print(f"[pipeline] Failed to parse PricedQuote: {e}")
         return ("error", None)
 
@@ -98,7 +81,7 @@ def _tag_price(raw: bytes) -> TaggedEvent:
 def _tag_client_response(raw: bytes) -> TaggedEvent:
     try:
         return ("client_response", from_nats_bytes(raw, ClientResponse))
-    except Exception as e:
+    except (ValueError, KeyError) as e:
         print(f"[pipeline] Failed to parse ClientResponse: {e}")
         return ("error", None)
 
@@ -111,8 +94,8 @@ def _key_by_rfq_id(tagged: TaggedEvent) -> str:
         return "__price_sink__"
     if isinstance(payload, ClientResponse):
         return payload.rfq_id
-    if isinstance(payload, RFQ):
-        return payload.rfq_id
+    if isinstance(payload, tuple):  # (RFQ, instrument_name)
+        return payload[0].rfq_id
     return "__error__"
 
 
@@ -147,18 +130,18 @@ class RFQStateMachine:
 
         outputs: list[EnrichedRFQ] = []
         if tag == "rfq":
-            outputs.extend(self._handle_rfq(payload))  # type: ignore[arg-type]
+            rfq, instrument_name = cast(tuple[RFQ, str], payload)
+            outputs.extend(self._handle_rfq(rfq, instrument_name))
         elif tag == "client_response":
             outputs.extend(self._handle_client_response(payload))  # type: ignore[arg-type]
         outputs.extend(self._check_ttl())
         return outputs
 
-    def _handle_rfq(self, rfq: RFQ) -> list[EnrichedRFQ]:
-        name = soul_lookup(rfq.isin)
+    def _handle_rfq(self, rfq: RFQ, instrument_name: str) -> list[EnrichedRFQ]:
         enriched = EnrichedRFQ(
             rfq_id=rfq.rfq_id,
             isin=rfq.isin,
-            instrument_name=name,
+            instrument_name=instrument_name,
             quantity=rfq.quantity,
             direction=rfq.direction,
             client_id=rfq.client_id,
@@ -281,7 +264,7 @@ class RepricingStateMachine:
 
 
 # ---------------------------------------------------------------------------
-# Dataflow assembly
+# Dataflow runner functions
 # ---------------------------------------------------------------------------
 
 def _run_state_machine(
@@ -321,21 +304,41 @@ def _tagged_price_to_repricing(tagged: TaggedEvent) -> Optional[RepricingEvent]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Dataflow assembly
+# ---------------------------------------------------------------------------
+
 flow = Dataflow("rfq_pipeline")
 
 rfq_raw      = op.input("rfq_source",      flow, NatsSource(subject="rfq.new"))
 price_raw    = op.input("price_source",    flow, NatsSource(subject="pricing.stream"))
 response_raw = op.input("response_source", flow, NatsSource(subject="rfq.client_response"))
 
-rfq_tagged      = op.map("tag_rfq",      rfq_raw,      _tag_rfq)
-price_tagged    = op.map("tag_price",    price_raw,    _tag_price)
-response_tagged = op.map("tag_response", response_raw, _tag_client_response)
+# Parse raw RFQ bytes → RFQ objects, drop parse errors
+rfq_parsed = op.filter_map("parse_rfq", rfq_raw, _parse_rfq)
 
-merged          = op.merge("merge_streams", rfq_tagged, price_tagged, response_tagged)
-keyed           = op.key_on("key_by_rfq_id", merged, _key_by_rfq_id)
-state_out       = op.stateful_map("rfq_state_machine", keyed, _run_state_machine)
+# Enrich with instrument name via Soul REST API — TTLCache keyed by ISIN,
+# re-fetches every 24 h, all other lookups are served from memory.
+rfq_enriched_named = op.enrich_cached(
+    "soul_enrich",
+    rfq_parsed,
+    soul_getter,
+    soul_mapper,
+    ttl=timedelta(hours=24),
+)
+
+# Tag all three streams
+rfq_tagged      = op.map("tag_rfq",      rfq_enriched_named, _tag_enriched_rfq)
+price_tagged    = op.map("tag_price",    price_raw,          _tag_price)
+response_tagged = op.map("tag_response", response_raw,       _tag_client_response)
+
+# RFQ lifecycle state machine (keyed by rfq_id)
+merged           = op.merge("merge_streams", rfq_tagged, price_tagged, response_tagged)
+keyed            = op.key_on("key_by_rfq_id", merged, _key_by_rfq_id)
+state_out        = op.stateful_map("rfq_state_machine", keyed, _run_state_machine)
 lifecycle_stream = op.flat_map("flatten_lifecycle", state_out, lambda pair: pair[1])
 
+# Repricing branch — re-emits QUOTED rows on every price tick for that ISIN
 repricing_filtered  = op.filter_map("lifecycle_to_repricing", lifecycle_stream, _lifecycle_to_repricing)
 price_for_repricing = op.filter_map("price_to_repricing", price_tagged, _tagged_price_to_repricing)
 repricing_merged    = op.merge("merge_repricing", repricing_filtered, price_for_repricing)

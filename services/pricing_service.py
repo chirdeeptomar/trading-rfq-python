@@ -14,6 +14,7 @@ import signal
 import sys
 
 import nats
+from nats.aio.msg import Msg
 
 from instruments_config import ISINS
 from models import MarketData, PricedQuote
@@ -47,7 +48,7 @@ async def run() -> None:
         if msg_count % 1_000 == 0:
             print(f"Processed {msg_count:,} pricing messages")
 
-    async def handler(msg: nats.aio.client.Msg) -> None:
+    async def handler(msg: Msg) -> None:
         try:
             md = MarketData.from_bytes(msg.data)
         except (KeyError, ValueError, TypeError) as e:
@@ -74,7 +75,7 @@ async def run() -> None:
     sub = await nc.subscribe(
         "market.data",
         cb=handler,
-        pending_msgs_limit=131_072,   # 2× NATS default; absorbs bursts
+        pending_msgs_limit=131_072,  # 2× NATS default; absorbs bursts
         pending_bytes_limit=64 * 1024 * 1024,  # 64 MB
     )
 

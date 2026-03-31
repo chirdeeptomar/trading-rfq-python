@@ -1,0 +1,24 @@
+[project]
+name = "streaming-bytewax-websocket"
+version = "0.1.0"
+description = "Financial trading streaming system with Bytewax, NATS, and WebSockets"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "nats-py>=2.14.0",
+    "bytewax>=0.21.0",
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "httpx>=0.28.0",
+    "pydantic>=2.10.0",
+    "websockets>=13.0",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.15.8",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"

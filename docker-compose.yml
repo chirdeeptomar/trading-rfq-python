@@ -1,0 +1,24 @@
+services:
+  soul:
+    image: dddmaster/soul-docker
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./instruments.db:/var/data/instruments.db
+    command: ["soul", "-d", "instruments.db", "-p", "8000", "-c", "*"]
+    depends_on:
+      - nats
+
+  nats:
+    image: nats:latest
+    container_name: nats-server
+    ports:
+      - "4222:4222" # Client port
+      - "8222:8222" # HTTP Monitoring port
+    command: ["-js"] # Enable JetStream for persistence
+    volumes:
+      - nats-data:/data
+    restart: unless-stopped
+
+volumes:
+  nats-data:

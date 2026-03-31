@@ -44,7 +44,10 @@
       "Bash(.venv/bin/pip install:*)",
       "Bash(.venv/bin/python -c \"import nats.aio.msg; print\\(nats.aio.msg.Msg\\)\")",
       "Bash(.venv/bin/python -c \"import bytewax.operators as op; print\\([x for x in dir\\(op\\) if ''filter'' in x.lower\\(\\) or ''flat'' in x.lower\\(\\)]\\)\")",
-      "Bash(.venv/bin/python -c \"import bytewax_pipeline\")"
+      "Bash(.venv/bin/python -c \"import bytewax_pipeline\")",
+      "Bash(.venv/bin/python -c \"from bytewax.pipeline import flow; print\\(''OK''\\)\")",
+      "Bash(.venv/bin/python -c \"from pipeline.pipeline import flow; print\\(''OK''\\)\")",
+      "Bash(.venv/bin/python -c \"from bytewax.run import cli_main; print\\(''ok''\\)\")"
     ]
   }
 }

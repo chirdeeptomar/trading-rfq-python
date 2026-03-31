@@ -87,7 +87,7 @@ PIDS+=($!)
 sleep 0.5
 
 echo ">>> Starting Bytewax Pipeline ..."
-uv run python -m bytewax.run bytewax_pipeline:flow &
+uv run python main.py &
 PIDS+=($!)
 
 sleep 1

@@ -35,8 +35,19 @@ async def run() -> None:
 
     msg_count = 0
 
-    async def handler(msg: nats.aio.client.Msg) -> None:
+    # One pending quote slot per ISIN — newer tick replaces older pending one
+    pending: dict[str, asyncio.Task[None]] = {}
+
+    async def _delayed_publish(quote: PricedQuote) -> None:
         nonlocal msg_count
+        # Randomised delay 5ms–5s simulates varying market liquidity per tick
+        await asyncio.sleep(random.uniform(0.005, 5.0))
+        await nc.publish("pricing.stream", quote.to_bytes())
+        msg_count += 1
+        if msg_count % 1_000 == 0:
+            print(f"Processed {msg_count:,} pricing messages")
+
+    async def handler(msg: nats.aio.client.Msg) -> None:
         try:
             md = MarketData.from_bytes(msg.data)
         except (KeyError, ValueError, TypeError) as e:
@@ -54,11 +65,11 @@ async def run() -> None:
             timestamp=md.timestamp,
         )
 
-        await nc.publish("pricing.stream", quote.to_bytes())
-        msg_count += 1
-
-        if msg_count % 10_000 == 0:
-            print(f"Processed {msg_count:,} pricing messages")
+        # Cancel any still-pending publish for this ISIN — only latest price matters
+        existing = pending.get(md.isin)
+        if existing and not existing.done():
+            existing.cancel()
+        pending[md.isin] = asyncio.create_task(_delayed_publish(quote))
 
     sub = await nc.subscribe(
         "market.data",
